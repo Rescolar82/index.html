@@ -1,4 +1,4 @@
-    <!doctype html>
+<!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8" />
@@ -9,6 +9,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <style>
     :root { --ok:#10b981; --bad:#ef4444; --bg:#0b1020; --fg:#e5e7eb; --muted:#94a3b8; }
+    * { box-sizing: border-box; }
     body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif}
     .wrap{max-width:1100px;margin:env(safe-area-inset-top) auto env(safe-area-inset-bottom);padding:16px}
     h1{font-size:20px;margin:0 0 12px}
@@ -24,7 +25,7 @@
     .ok{background:rgba(16,185,129,.15);color:var(--ok);border:1px solid rgba(16,185,129,.35)}
     .bad{background:rgba(239,68,68,.15);color:var(--bad);border:1px solid rgba(239,68,68,.35)}
     .pill{font-size:12px;color:var(--muted);padding:4px 8px;border:1px dashed #334155;border-radius:999px}
-    canvas{width:100%;border-radius:12px;background:#0b1220;touch-action:none} /* <- importante para iOS */
+    canvas{width:100%;border-radius:12px;background:#0b1220;touch-action:none} /* <- imprescindible en iOS */
     .small{font-size:12px;color:var(--muted)}
     .kbd{background:#111827;border:1px solid #374151;border-radius:6px;padding:2px 6px;font-family:ui-monospace,monospace;font-size:12px}
   </style>
@@ -34,7 +35,7 @@
     <h1>Detector “¿está en su lugar?” — iPhone/Android</h1>
 
     <div class="grid">
-      <!-- Cámara -->
+      <!-- Cámara / Live -->
       <div class="card">
         <div class="row">
           <span id="opencvStatus" class="pill">Cargando OpenCV…</span>
@@ -81,12 +82,19 @@
     </div>
   </div>
 
+  <!-- OpenCV.js -->
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
   <script>
+    // --------- Estado global ----------
     let cvReady=false, drawingROI=false, roi=null, templateMat=null, expectedCenter=null;
     let running=false, timer=null, lastAlert=false, fpsCounter={t0:performance.now(),frames:0};
     let currentStream=null, currentFacing='environment', cachedDeviceIds={ user:null, environment:null };
 
+    // Referencia base para poder limpiar correctamente y dibujar siempre sobre la foto
+    let refImg=null;     // Image()
+    let refDraw=null;    // {x,y,w,h} dónde se dibuja la imagen dentro del canvas
+
+    // DOM
     const opencvStatus=document.getElementById('opencvStatus');
     const runStatus=document.getElementById('runStatus');
     const alertStatus=document.getElementById('alertStatus');
@@ -117,7 +125,26 @@
     threshold.addEventListener('input',()=> thVal.textContent=Number(threshold.value).toFixed(2));
     tolerance.addEventListener('input',()=> tolVal.textContent=tolerance.value);
 
-    // ---- Audio unlock iOS ----
+    // --------- Helpers referencia ----------
+    function drawRefBase(){
+      const {width, height} = canvasRef;
+      ctxRef.clearRect(0,0,width,height);
+      if (refImg && refDraw){
+        ctxRef.drawImage(refImg, refDraw.x, refDraw.y, refDraw.w, refDraw.h);
+      }
+    }
+    function updateROIOverlay(){
+      drawRefBase(); // redibuja la foto limpia
+      if (roi){
+        ctxRef.save();
+        ctxRef.strokeStyle='rgba(16,185,129,.9)';
+        ctxRef.lineWidth=2; ctxRef.setLineDash([6,4]);
+        ctxRef.strokeRect(roi.x, roi.y, roi.w, roi.h);
+        ctxRef.restore();
+      }
+    }
+
+    // --------- Audio (beep) y desbloqueo iOS ----------
     let audioUnlocked=false;
     function ensureAudioUnlocked(){
       if (audioUnlocked) return;
@@ -139,92 +166,125 @@
       }catch(e){}
     }
 
-    // ---- Carga referencia ----
+    // --------- Cargar foto de referencia ----------
     refFile.addEventListener('change',(e)=>{
-      const file=e.target.files?.[0]; if(!file) return;
+      const file=e.target.files?.[0]; if (!file) return;
       const img=new Image();
       img.onload=()=>{
+        // encajar manteniendo proporción dentro del canvasRef
         const scale=Math.min(canvasRef.width/img.width, canvasRef.height/img.height);
         const w=img.width*scale, h=img.height*scale;
-        const x=(canvasRef.width-w)/2, y=(canvasRef.height-h)/2;
-        ctxRef.clearRect(0,0,canvasRef.width,canvasRef.height);
-        ctxRef.drawImage(img,x,y,w,h);
-        roi=null; expectedCenter=null; updateROIOverlay();
+        const x=(canvasRef.width - w)/2, y=(canvasRef.height - h)/2;
+
+        refImg = img;
+        refDraw = {x,y,w,h};
+        drawRefBase();
+
+        roi=null; expectedCenter=null;
         btnDraw.disabled=false; btnClearROI.disabled=false; tplInfo.textContent='—';
         if (templateMat){ templateMat.delete(); templateMat=null; }
       };
       img.src=URL.createObjectURL(file);
     });
 
-    // ---- Dibujo ROI con pointer/touch ----
+    // --------- Dibujo ROI (pointer + fallback touch) con coordenadas escaladas ----------
     let dragStart=null;
     function getPos(ev,canvas){
       const r=canvas.getBoundingClientRect();
-      let cx,cy;
-      if (ev.touches && ev.touches[0]){ cx=ev.touches[0].clientX; cy=ev.touches[0].clientY; }
-      else { cx=ev.clientX; cy=ev.clientY; }
-      return { x: cx-r.left, y: cy-r.top };
+      // Ajuste por escalado CSS y devicePixelRatio
+      const scaleX = canvas.width  / r.width;
+      const scaleY = canvas.height / r.height;
+      const touch = ev.touches && ev.touches[0];
+      const cx = touch ? touch.clientX : ev.clientX;
+      const cy = touch ? touch.clientY : ev.clientY;
+      return { x: (cx - r.left) * scaleX, y: (cy - r.top) * scaleY };
     }
-    canvasRef.addEventListener('pointerdown',(ev)=>{ if(!drawingROI) return; canvasRef.setPointerCapture(ev.pointerId); dragStart=getPos(ev,canvasRef); });
-    canvasRef.addEventListener('pointermove',(ev)=>{ if(!drawingROI||!dragStart) return; const p=getPos(ev,canvasRef);
-      const x=Math.min(dragStart.x,p.x), y=Math.min(dragStart.y,p.y);
-      const w=Math.abs(p.x-dragStart.x), h=Math.abs(p.y-dragStart.y);
-      roi={x,y,w,h}; updateROIOverlay(true);
+
+    canvasRef.addEventListener('pointerdown',(ev)=>{
+      if (!drawingROI) return;
+      canvasRef.setPointerCapture(ev.pointerId);
+      dragStart = getPos(ev, canvasRef);
     });
-    canvasRef.addEventListener('pointerup',(ev)=>{ if(!drawingROI||!roi||roi.w<10||roi.h<10){ dragStart=null; return; }
+    canvasRef.addEventListener('pointermove',(ev)=>{
+      if (!drawingROI || !dragStart) return;
+      const p = getPos(ev, canvasRef);
+      const x=Math.min(dragStart.x, p.x);
+      const y=Math.min(dragStart.y, p.y);
+      const w=Math.abs(p.x - dragStart.x);
+      const h=Math.abs(p.y - dragStart.y);
+      roi = {x,y,w,h};
+      updateROIOverlay();
+    });
+    canvasRef.addEventListener('pointerup',(ev)=>{
+      if (!drawingROI || !roi || roi.w<10 || roi.h<10){ dragStart=null; return; }
       try{ canvasRef.releasePointerCapture(ev.pointerId); }catch(_){}
       drawingROI=false; btnDraw.textContent='✏️ Dibujar zona esperada'; dragStart=null;
+
+      // Asegúrate de no capturar el overlay dentro de la plantilla
+      drawRefBase();
       if (templateMat){ templateMat.delete(); templateMat=null; }
       const src=cv.imread(canvasRef);
       let tpl=src.roi(new cv.Rect(Math.round(roi.x),Math.round(roi.y),Math.round(roi.w),Math.round(roi.h)));
-      cv.cvtColor(tpl,tpl,cv.COLOR_RGBA2GRAY); cv.GaussianBlur(tpl,tpl,new cv.Size(3,3),0);
+      cv.cvtColor(tpl,tpl,cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(tpl,tpl,new cv.Size(3,3),0);
       templateMat=tpl; src.delete();
       expectedCenter={ x: roi.x+roi.w/2, y: roi.y+roi.h/2 };
-      tplInfo.textContent=`${templateMat.cols}×${templateMat.rows}`; updateROIOverlay();
+      tplInfo.textContent=`${templateMat.cols}×${templateMat.rows}`;
+      updateROIOverlay();
     });
-    // Fallback touch (por si algún iOS antiguo ignora pointer events)
+
+    // Fallback touch (por si acaso)
     canvasRef.addEventListener('touchstart',(ev)=>{ if(!drawingROI) return; ev.preventDefault(); dragStart=getPos(ev,canvasRef); },{passive:false});
-    canvasRef.addEventListener('touchmove',(ev)=>{ if(!drawingROI||!dragStart) return; ev.preventDefault(); const p=getPos(ev,canvasRef);
+    canvasRef.addEventListener('touchmove',(ev)=>{ if(!drawingROI||!dragStart) return; ev.preventDefault();
+      const p=getPos(ev,canvasRef);
       const x=Math.min(dragStart.x,p.x), y=Math.min(dragStart.y,p.y);
       const w=Math.abs(p.x-dragStart.x), h=Math.abs(p.y-dragStart.y);
-      roi={x,y,w,h}; updateROIOverlay(true);
+      roi={x,y,w,h}; updateROIOverlay();
     },{passive:false});
     canvasRef.addEventListener('touchend',(ev)=>{ if(!drawingROI||!roi||roi.w<10||roi.h<10){ dragStart=null; return; }
       drawingROI=false; btnDraw.textContent='✏️ Dibujar zona esperada'; dragStart=null;
+
+      drawRefBase();
       if (templateMat){ templateMat.delete(); templateMat=null; }
       const src=cv.imread(canvasRef);
       let tpl=src.roi(new cv.Rect(Math.round(roi.x),Math.round(roi.y),Math.round(roi.w),Math.round(roi.h)));
       cv.cvtColor(tpl,tpl,cv.COLOR_RGBA2GRAY); cv.GaussianBlur(tpl,tpl,new cv.Size(3,3),0);
       templateMat=tpl; src.delete();
       expectedCenter={ x: roi.x+roi.w/2, y: roi.y+roi.h/2 };
-      tplInfo.textContent=`${templateMat.cols}×${templateMat.rows}`; updateROIOverlay();
+      tplInfo.textContent=`${templateMat.cols}×${templateMat.rows}`;
+      updateROIOverlay();
     },{passive:false});
 
-    btnDraw.addEventListener('click',()=>{ drawingROI=!drawingROI; btnDraw.textContent = drawingROI ? '✅ Terminar dibujo' : '✏️ Dibujar zona esperada'; });
-    btnClearROI.addEventListener('click',()=>{ roi=null; expectedCenter=null; if (templateMat){ templateMat.delete(); templateMat=null; } tplInfo.textContent='—'; updateROIOverlay(); });
+    btnDraw.addEventListener('click',()=>{
+      drawingROI = !drawingROI;
+      btnDraw.textContent = drawingROI ? '✅ Terminar dibujo' : '✏️ Dibujar zona esperada';
+    });
 
-    function updateROIOverlay(){
-      const imgData=ctxRef.getImageData(0,0,canvasRef.width,canvasRef.height);
-      ctxRef.putImageData(imgData,0,0);
-      if (roi){ ctxRef.save(); ctxRef.strokeStyle='rgba(16,185,129,.9)'; ctxRef.lineWidth=2; ctxRef.setLineDash([6,4]); ctxRef.strokeRect(roi.x,roi.y,roi.w,roi.h); ctxRef.restore(); }
-    }
+    btnClearROI.addEventListener('click', ()=>{
+      roi=null; expectedCenter=null;
+      if (templateMat){ templateMat.delete(); templateMat=null; }
+      tplInfo.textContent='—';
+      drawRefBase(); // limpieza real
+    });
 
-    // ---- Cámara (iOS-friendly) ----
+    // --------- Cámara (iOS-friendly) ----------
     async function stopStream(){ if(currentStream){ currentStream.getTracks().forEach(t=>t.stop()); } currentStream=null; }
     async function listCameras(){
       try{
         const devices=await navigator.mediaDevices.enumerateDevices();
         devices.filter(d=>d.kind==='videoinput').forEach(d=>{
           const label=(d.label||'').toLowerCase();
-          if(label.includes('back')||label.includes('rear')) cachedDeviceIds.environment=d.deviceId;
-          if(label.includes('front')) cachedDeviceIds.user=d.deviceId;
+          if (label.includes('back')||label.includes('rear')) cachedDeviceIds.environment=d.deviceId;
+          if (label.includes('front')) cachedDeviceIds.user=d.deviceId;
         });
       }catch(e){}
     }
     async function startCamera(prefer='environment'){
-      await stopStream(); ensureAudioUnlocked();
+      await stopStream();
+      ensureAudioUnlocked();
       let constraints={ video:{ facingMode: prefer }, audio:false };
-      const devId=cachedDeviceIds[prefer]; if (devId) constraints.video={ deviceId:{ exact: devId } };
+      const devId=cachedDeviceIds[prefer];
+      if (devId) constraints.video = { deviceId:{ exact: devId } };
       try{
         const stream=await navigator.mediaDevices.getUserMedia(constraints);
         currentStream=stream; video.srcObject=stream; await video.play();
@@ -256,8 +316,10 @@
     function drawExpectedBox(ctx){
       if (!roi) return;
       ctx.save(); ctx.strokeStyle='rgba(59,130,246,.9)'; ctx.lineWidth=2; ctx.setLineDash([6,4]);
-      const rx=roi.x*(canvasLive.width/canvasRef.width), ry=roi.y*(canvasLive.height/canvasRef.height);
-      const rw=roi.w*(canvasLive.width/canvasRef.width), rh=roi.h*(canvasLive.height/canvasRef.height);
+      const rx=roi.x*(canvasLive.width/canvasRef.width),
+            ry=roi.y*(canvasLive.height/canvasRef.height),
+            rw=roi.w*(canvasLive.width/canvasRef.width),
+            rh=roi.h*(canvasLive.height/canvasRef.height);
       ctx.strokeRect(rx,ry,rw,rh); ctx.restore();
     }
 
@@ -266,7 +328,8 @@
       const W=canvasLive.width,H=canvasLive.height;
       ctxLive.drawImage(video,0,0,W,H);
 
-      if(!templateMat){ drawExpectedBox(ctxLive); return; } // permitir cámara sin ROI listo
+      // Si no hay plantilla aún, solo muestra la caja esperada (si existe)
+      if (!templateMat){ drawExpectedBox(ctxLive); return; }
 
       let frame=cv.imread(canvasLive), gray=new cv.Mat();
       cv.cvtColor(frame,gray,cv.COLOR_RGBA2GRAY); cv.GaussianBlur(gray,gray,new cv.Size(3,3),0);
@@ -275,7 +338,14 @@
       let result=new cv.Mat(resultRows,resultCols,cv.CV_32FC1);
       cv.matchTemplate(gray,templateMat,result,cv.TM_CCOEFF_NORMED);
       let mm=cv.minMaxLoc(result); const best=mm.maxLoc, score=mm.maxVal;
-      if(chkDebug.checked){ ctxLive.save(); ctxLive.strokeStyle='rgba(16,185,129,.9)'; ctxLive.lineWidth=2; ctxLive.setLineDash([]); ctxLive.strokeRect(best.x,best.y,templateMat.cols,templateMat.rows); ctxLive.restore(); }
+
+      if (chkDebug.checked){
+        ctxLive.save();
+        ctxLive.strokeStyle='rgba(16,185,129,.9)';
+        ctxLive.lineWidth=2; ctxLive.setLineDash([]);
+        ctxLive.strokeRect(best.x,best.y,templateMat.cols,templateMat.rows);
+        ctxLive.restore();
+      }
       drawExpectedBox(ctxLive);
 
       const bestCenter={x:best.x+templateMat.cols/2,y:best.y+templateMat.rows/2};
@@ -291,10 +361,14 @@
 
       fpsCounter.frames++; const t1=performance.now();
       if(t1-fpsCounter.t0>=1000){ fpsInfo.textContent=fpsCounter.frames+' fps'; fpsCounter.frames=0; fpsCounter.t0=t1; }
+
       frame.delete(); gray.delete(); result.delete();
     }
 
-    window.Module={ onRuntimeInitialized(){ cvReady=true; opencvStatus.textContent='OpenCV listo'; btnStart.disabled=false; } };
+    // --------- OpenCV init ----------
+    window.Module = {
+      onRuntimeInitialized(){ cvReady=true; opencvStatus.textContent='OpenCV listo'; btnStart.disabled=false; }
+    };
   </script>
 </body>
 </html>
