@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Detector de objeto en su lugar (Oso/Pesas)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --ok:#10b981; --bad:#ef4444; --bg:#0b1020; --fg:#e5e7eb; --muted:#94a3b8; }
+    body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif}
+    .wrap{max-width:1100px;margin:20px auto;padding:16px}
+    h1{font-size:20px;margin:0 0 12px}
+    .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}
+    .card{background:#0f172a;border:1px solid #1f2937;border-radius:16px;padding:12px;box-shadow:0 6px 24px rgba(0,0,0,.25)}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+    label{font-size:13px;color:var(--muted)}
+    button,.btn{background:#1f2937;color:var(--fg);border:1px solid #374151;border-radius:12px;padding:8px 12px;cursor:pointer}
+    button:disabled{opacity:.45;cursor:not-allowed}
+    input[type="range"]{width:180px}
+    .status{font-weight:700;padding:8px 12px;border-radius:999px;display:inline-flex;align-items:center;gap:8px}
+    .ok{background:rgba(16,185,129,.15);color:var(--ok);border:1px solid rgba(16,185,129,.35)}
+    .bad{background:rgba(239,68,68,.15);color:var(--bad);border:1px solid rgba(239,68,68,.35)}
+    .pill{font-size:12px;color:var(--muted);padding:4px 8px;border:1px dashed #334155;border-radius:999px}
+    canvas{width:100%;border-radius:12px;background:#0b1220}
+    .small{font-size:12px;color:var(--muted)}
+    .kbd{background:#111827;border:1px solid #374151;border-radius:6px;padding:2px 6px;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;font-size:12px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Detector “¿está en su lugar?” — Demo con Oso</h1>
+
+    <div class="grid">
+      <!-- Lado A: Cámara en vivo -->
+      <div class="card">
+        <div class="row">
+          <span id="opencvStatus" class="pill">Cargando OpenCV…</span>
+          <span id="runStatus" class="status ok" style="display:none;">Listo</span>
+          <span id="alertStatus" class="status bad" style="display:none;">FUERA DE SITIO</span>
+        </div>
+        <div class="row">
+          <button id="btnStart" disabled>Empezar cámara</button>
+          <button id="btnStop" disabled>Detener</button>
+          <label class="small"><input type="checkbox" id="chkBeep" checked> Beep al fallar</label>
+          <label class="small"><input type="checkbox" id="chkDebug" checked> Ver debug</label>
+        </div>
+        <div class="row">
+          <label>Umbral (match): <span id="thVal">0.80</span></label>
+          <input type="range" id="threshold" min="0.50" max="0.98" step="0.01" value="0.80">
+          <label>Tolerancia (px): <span id="tolVal">40</span></label>
+          <input type="range" id="tolerance" min="10" max="200" step="2" value="40">
+        </div>
+        <video id="video" playsinline muted style="display:none"></video>
+        <canvas id="canvasLive" width="960" height="540"></canvas>
+        <p class="small">Consejo: ilumina bien y mantén el encuadre similar a la referencia para mayor estabilidad.</p>
+      </div>
+
+      <!-- Lado B: Referencia -->
+      <div class="card">
+        <div class="row">
+          <input id="refFile" type="file" accept="image/*">
+          <button id="btnDraw" disabled>✏️ Dibujar zona esperada</button>
+          <button id="btnClearROI" disabled>Limpiar zona</button>
+        </div>
+        <canvas id="canvasRef" width="640" height="360" title="Sube la foto y dibuja la zona del oso"></canvas>
+        <p class="small">
+          1) Sube foto de referencia con el objeto “en su sitio”.<br>
+          2) Pulsa <span class="kbd">Dibujar zona</span> y traza un rectángulo sobre el oso.<br>
+          3) Arriba, ajusta <span class="kbd">Umbral</span> y <span class="kbd">Tolerancia</span> si hace falta.
+        </p>
+        <div class="row">
+          <span class="pill">Template: <span id="tplInfo">—</span></span>
+          <span class="pill">Frame: <span id="fpsInfo">—</span></span>
+          <span class="pill">Score: <span id="scoreInfo">—</span></span>
+          <span class="pill">Dist: <span id="distInfo">—</span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- OpenCV.js -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+  <script>
+    // ---------- Estado global ----------
+    let cvReady = false;
+    let drawingROI = false;
+    let roi = null; // {x,y,w,h} en canvasRef
+    let templateMat = null; // cv.Mat del recorte (gris)
+    let expectedCenter = null; // {x,y} centro ROI en referencia (escala ref->live se maneja por tamaño procesado)
+    let running = false;
+    let timer = null;
+    let lastAlert = false;
+    let fpsCounter = {t0: performance.now(), frames:0};
+
+    // DOM
+    const opencvStatus = document.getElementById('opencvStatus');
+    const runStatus = document.getElementById('runStatus');
+    const alertStatus = document.getElementById('alertStatus');
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const chkBeep = document.getElementById('chkBeep');
+    const chkDebug = document.getElementById('chkDebug');
+    const threshold = document.getElementById('threshold');
+    const thVal = document.getElementById('thVal');
+    const tolerance = document.getElementById('tolerance');
+    const tolVal = document.getElementById('tolVal');
+    const refFile = document.getElementById('refFile');
+    const btnDraw = document.getElementById('btnDraw');
+    const btnClearROI = document.getElementById('btnClearROI');
+    const canvasRef = document.getElementById('canvasRef');
+    const ctxRef = canvasRef.getContext('2d');
+    const canvasLive = document.getElementById('canvasLive');
+    const ctxLive = canvasLive.getContext('2d');
+    const video = document.getElementById('video');
+    const tplInfo = document.getElementById('tplInfo');
+    const fpsInfo = document.getElementById('fpsInfo');
+    const scoreInfo = document.getElementById('scoreInfo');
+    const distInfo = document.getElementById('distInfo');
+
+    thVal.textContent = Number(threshold.value).toFixed(2);
+    tolVal.textContent = tolerance.value;
+
+    threshold.addEventListener('input', ()=> thVal.textContent = Number(threshold.value).toFixed(2));
+    tolerance.addEventListener('input', ()=> tolVal.textContent = tolerance.value);
+
+    // ---------- Beep sin archivos (WebAudio) ----------
+    function beep() {
+      if (!chkBeep.checked) return;
+      try{
+        const ac = new (window.AudioContext || window.webkitAudioContext)();
+        const o = ac.createOscillator();
+        const g = ac.createGain();
+        o.connect(g); g.connect(ac.destination);
+        o.type = 'square'; o.frequency.value = 880;
+        g.gain.value = 0.05;
+        o.start();
+        setTimeout(()=>{ o.stop(); ac.close(); }, 160);
+      }catch(e){}
+    }
+
+    // ---------- Carga de referencia ----------
+    refFile.addEventListener('change', (e)=>{
+      const file = e.target.files?.[0];
+      if (!file) return;
+      const img = new Image();
+      img.onload = ()=>{
+        // encajamos en canvasRef manteniendo proporción
+        const scale = Math.min(canvasRef.width / img.width, canvasRef.height / img.height);
+        const w = img.width * scale, h = img.height * scale;
+        const x = (canvasRef.width - w)/2, y = (canvasRef.height - h)/2;
+        ctxRef.clearRect(0,0,canvasRef.width,canvasRef.height);
+        ctxRef.drawImage(img, x,y,w,h);
+        roi = null;
+        updateROIOverlay();
+        btnDraw.disabled = false;
+        btnClearROI.disabled = false;
+        tplInfo.textContent = '—';
+        if (templateMat){ templateMat.delete(); templateMat=null; }
+        expectedCenter = null;
+      };
+      img.src = URL.createObjectURL(file);
+    });
+
+    btnDraw.addEventListener('click', ()=>{
+      drawingROI = !drawingROI;
+      btnDraw.textContent = drawingROI ? '✅ Terminar dibujo' : '✏️ Dibujar zona esperada';
+    });
+
+    btnClearROI.addEventListener('click', ()=>{
+      roi = null;
+      expectedCenter = null;
+      if (templateMat){ templateMat.delete(); templateMat=null; }
+      tplInfo.textContent = '—';
+      updateROIOverlay();
+    });
+
+    // Dibujo de ROI en el canvasRef
+    let dragStart = null;
+    canvasRef.addEventListener('mousedown', (ev)=>{
+      if (!drawingROI) return;
+      const r = canvasRef.getBoundingClientRect();
+      dragStart = {x: ev.clientX - r.left, y: ev.clientY - r.top};
+    });
+    canvasRef.addEventListener('mousemove', (ev)=>{
+      if (!drawingROI || !dragStart) return;
+      const r = canvasRef.getBoundingClientRect();
+      const x = Math.min(dragStart.x, ev.clientX - r.left);
+      const y = Math.min(dragStart.y, ev.clientY - r.top);
+      const w = Math.abs((ev.clientX - r.left) - dragStart.x);
+      const h = Math.abs((ev.clientY - r.top) - dragStart.y);
+      roi = {x,y,w,h};
+      updateROIOverlay(true);
+    });
+    canvasRef.addEventListener('mouseup', ()=>{
+      if (!drawingROI || !roi || roi.w<10 || roi.h<10) { dragStart=null; return; }
+      drawingROI = false;
+      btnDraw.textContent = '✏️ Dibujar zona esperada';
+      dragStart = null;
+      // Crear templateMat desde ROI
+      if (templateMat){ templateMat.delete(); templateMat=null; }
+      const src = cv.imread(canvasRef);
+      let tpl = src.roi(new cv.Rect(Math.round(roi.x),Math.round(roi.y),Math.round(roi.w),Math.round(roi.h)));
+      // convertir a gris + suavizar
+      cv.cvtColor(tpl, tpl, cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(tpl, tpl, new cv.Size(3,3), 0);
+      templateMat = tpl; // mantener
+      src.delete();
+      expectedCenter = { x: roi.x + roi.w/2, y: roi.y + roi.h/2 };
+      tplInfo.textContent = `${templateMat.cols}×${templateMat.rows}`;
+      updateROIOverlay();
+    });
+
+    function updateROIOverlay(showLiveDrag=false){
+      // Redibujar canvasRef con un velo sutil y el rectángulo si existe
+      const imgData = ctxRef.getImageData(0,0,canvasRef.width,canvasRef.height);
+      ctxRef.putImageData(imgData,0,0); // ya estaba dibujado
+      if (roi){
+        ctxRef.save();
+        ctxRef.strokeStyle = 'rgba(16,185,129,.9)';
+        ctxRef.lineWidth = 2;
+        ctxRef.setLineDash([6,4]);
+        ctxRef.strokeRect(roi.x, roi.y, roi.w, roi.h);
+        ctxRef.restore();
+      } else if (showLiveDrag){
+        // nada
+      }
+    }
+
+    // ---------- Cámara ----------
+    btnStart.addEventListener('click', async ()=>{
+      if (!cvReady || !templateMat){ alert('Sube la foto y dibuja la zona del objeto primero.'); return; }
+      try{
+        btnStart.disabled = true;
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio:false });
+        video.srcObject = stream;
+        await video.play();
+        btnStop.disabled = false;
+        runStatus.style.display = 'inline-flex';
+        startLoop();
+      }catch(e){
+        console.error(e);
+        btnStart.disabled = false;
+        alert('No se pudo acceder a la cámara.');
+      }
+    });
+
+    btnStop.addEventListener('click', ()=>{
+      stopLoop();
+      const s = video.srcObject;
+      if (s){ s.getTracks().forEach(t=>t.stop()); }
+      video.srcObject = null;
+      btnStop.disabled = true;
+      btnStart.disabled = false;
+      runStatus.style.display = 'none';
+      alertStatus.style.display = 'none';
+    });
+
+    function startLoop(){
+      running = true;
+      lastAlert = false;
+      fpsCounter = {t0: performance.now(), frames:0};
+      if (timer) clearInterval(timer);
+      // ~10 FPS procesamiento
+      timer = setInterval(processFrame, 100);
+    }
+    function stopLoop(){
+      running = false;
+      if (timer){ clearInterval(timer); timer=null; }
+    }
+
+    function drawExpectedBox(ctx){
+      if (!roi) return;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(59,130,246,.9)'; // azul esperado
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6,4]);
+      // Escalamos ROI de canvasRef -> canvasLive manteniendo proporciones relativas (asumimos misma relación de aspecto)
+      const rx = roi.x * (canvasLive.width / canvasRef.width);
+      const ry = roi.y * (canvasLive.height / canvasRef.height);
+      const rw = roi.w * (canvasLive.width / canvasRef.width);
+      const rh = roi.h * (canvasLive.height / canvasRef.height);
+      ctx.strokeRect(rx, ry, rw, rh);
+      ctx.restore();
+    }
+
+    function processFrame(){
+      if (!running) return;
+      // Pintar el frame de vídeo en canvasLive
+      const W = canvasLive.width, H = canvasLive.height;
+      ctxLive.drawImage(video, 0,0,W,H);
+
+      // Convertir a Mat y gris + blur
+      let frame = cv.imread(canvasLive);
+      let gray = new cv.Mat();
+      cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(gray, gray, new cv.Size(3,3), 0);
+
+      // matchTemplate
+      const resultCols = gray.cols - templateMat.cols + 1;
+      const resultRows = gray.rows - templateMat.rows + 1;
+      if (resultCols < 1 || resultRows < 1){
+        // Template más grande que el frame procesado
+        frame.delete(); gray.delete();
+        return;
+      }
+      let result = new cv.Mat(resultRows, resultCols, cv.CV_32FC1);
+      cv.matchTemplate(gray, templateMat, result, cv.TM_CCOEFF_NORMED);
+      let mm = cv.minMaxLoc(result);
+      const best = mm.maxLoc; // punto topleft
+      const score = mm.maxVal;
+
+      // Dibujar rect best + caja esperada
+      if (document.getElementById('chkDebug').checked){
+        ctxLive.save();
+        ctxLive.strokeStyle = 'rgba(16,185,129,.9)';
+        ctxLive.lineWidth = 2;
+        ctxLive.setLineDash([]);
+        ctxLive.strokeRect(best.x, best.y, templateMat.cols, templateMat.rows);
+        ctxLive.restore();
+        drawExpectedBox(ctxLive);
+      }
+
+      // Distancia entre centros (best vs esperado)
+      const bestCenter = { x: best.x + templateMat.cols/2, y: best.y + templateMat.rows/2 };
+      // Convert expectedCenter de ref-space -> live-space
+      let exp = { 
+        x: expectedCenter ? expectedCenter.x * (canvasLive.width / canvasRef.width) : bestCenter.x,
+        y: expectedCenter ? expectedCenter.y * (canvasLive.height / canvasRef.height) : bestCenter.y
+      };
+      const dx = bestCenter.x - exp.x;
+      const dy = bestCenter.y - exp.y;
+      const dist = Math.hypot(dx,dy);
+
+      // Umbrales
+      const ok = (score >= Number(threshold.value)) && (dist <= Number(tolerance.value));
+      document.getElementById('alertStatus').style.display = ok ? 'none' : 'inline-flex';
+
+      // Beep al pasar a fallo
+      if (!ok && !lastAlert) beep();
+      lastAlert = !ok;
+
+      // HUD
+      document.getElementById('scoreInfo').textContent = score.toFixed(3);
+      document.getElementById('distInfo').textContent = Math.round(dist) + ' px';
+
+      // FPS
+      fpsCounter.frames++;
+      const t1 = performance.now();
+      if (t1 - fpsCounter.t0 >= 1000){
+        document.getElementById('fpsInfo').textContent = fpsCounter.frames + ' fps';
+        fpsCounter.frames = 0;
+        fpsCounter.t0 = t1;
+      }
+
+      // liberar
+      frame.delete(); gray.delete(); result.delete();
+    }
+
+    // ---------- OpenCV init ----------
+    window.Module = {
+      onRuntimeInitialized(){
+        cvReady = true;
+        opencvStatus.textContent = 'OpenCV listo';
+        btnStart.disabled = false; // se habilitará realmente al tener template
+      }
+    };
+
+    // Habilitar start sólo cuando exista template
+    const enableStartIfReady = ()=>{
+      btnStart.disabled = !(cvReady && templateMat);
+    };
+    setInterval(enableStartIfReady, 400);
+  </script>
+</body>
+</html>
