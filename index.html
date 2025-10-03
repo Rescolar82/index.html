@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+  <title>Raccoon Rush — MVP limpio</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <h1>Raccoon Rush</h1>
+      <span class="muted">MVP limpio</span>
+    </div>
+    <div class="actions">
+      <button id="btnFull" class="btn">Pantalla completa</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <div id="gameWrap">
+      <canvas id="game" width="960" height="540"></canvas>
+
+      <!-- HUD -->
+      <div class="hud">
+        <div id="hud-left">Puntos: 0</div>
+        <div id="hud-mid">x1.0</div>
+        <div id="hud-right">🏆 0</div>
+      </div>
+
+      <!-- Mobile controls -->
+      <div id="mobileControls">
+        <button class="ctrl" id="btnLeft">←</button>
+        <button class="ctrl" id="btnJump">⤒</button>
+        <button class="ctrl" id="btnRight">→</button>
+      </div>
+
+      <!-- Overlays -->
+      <div id="overlay" class="overlay hidden">
+        <div class="card">
+          <h2 id="ov-title">Raccoon Rush</h2>
+          <p id="ov-sub" class="muted">Listo para empezar</p>
+          <div class="row">
+            <button id="btnStart" class="btn primary">Jugar</button>
+            <button id="btnHow" class="btn">Cómo jugar</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="overlayHow" class="overlay hidden">
+        <div class="card">
+          <h3>Controles</h3>
+          <p>PC: ← → moverse, ␣ saltar. Móvil: botones o deslizar (izq/der/arriba).</p>
+          <p>Esquiva cajas y globos. Toma ⭐ para multiplicador.</p>
+          <div class="row"><button id="btnBack" class="btn">Volver</button></div>
+        </div>
+      </div>
+
+      <div id="overlayGameOver" class="overlay hidden">
+        <div class="card">
+          <h2>Game Over</h2>
+          <p id="ov-score" class="muted">Puntos: 0</p>
+          <div class="row">
+            <button id="btnRetry" class="btn primary">Reintentar</button>
+            <button id="btnHome" class="btn">Inicio</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer class="btm">
+    <span class="muted">© Raccoon Rush</span>
+  </footer>
+
+  <script src="game.js" type="module"></script>
+</body>
+</html>
